@@ -9,6 +9,12 @@ import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+try:
+    import nvtx
+except ImportError:
+    nvtx = None
+
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
@@ -16,6 +22,7 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX
 
 logger = init_logger(__name__)
 
@@ -356,6 +363,11 @@ def rejection_sample(
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    if nvtx:
+        if SYNC_BEFORE_NVTX:
+            torch.cuda.synchronize()
+        nvtx.push_range("spec_decode_scoring")
+    
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -395,6 +407,10 @@ def rejection_sample(
             max_spec_len,
         )
         if sampling_metadata.all_greedy:
+            if nvtx:
+                if SYNC_BEFORE_NVTX:
+                    torch.cuda.synchronize()
+                nvtx.pop_range()
             return output_token_ids
 
     # Compute probability distribution from target logits.
@@ -438,6 +454,12 @@ def rejection_sample(
         vocab_size,
         NO_DRAFT_PROBS=draft_probs is None,
     )
+    
+    if nvtx:
+        if SYNC_BEFORE_NVTX:
+            torch.cuda.synchronize()
+        nvtx.pop_range()
+    
     return output_token_ids
 
 

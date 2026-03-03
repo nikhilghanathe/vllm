@@ -195,6 +195,9 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Per-iteration spec decode phase times (seconds), from CUDA events.
+    spec_decode_phase_times: dict[str, float] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

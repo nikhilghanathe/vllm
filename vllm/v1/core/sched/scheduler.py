@@ -1479,6 +1479,16 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        # Merge CUDA-event phase times into spec_decoding_stats.
+        phase_times = model_runner_output.spec_decode_phase_times
+        if phase_times:
+            if spec_decoding_stats is None:
+                # Baseline mode: create a minimal stats object just
+                # for target_forward timing (no drafts/acceptance).
+                spec_decoding_stats = SpecDecodingStats.new(
+                    self.num_spec_tokens)
+            spec_decoding_stats.add_phase_times(phase_times)
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats

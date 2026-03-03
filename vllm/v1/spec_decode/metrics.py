@@ -35,6 +35,11 @@ class SpecDecodingStats:
             num_accepted_tokens_per_pos=[0] * num_spec_tokens,
         )
 
+    # Phase timing (seconds), accumulated per step.
+    target_forward_time_s: float = 0.0
+    draft_time_s: float = 0.0
+    scoring_time_s: float = 0.0
+
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         self.num_drafts += 1
         self.num_draft_tokens += num_draft_tokens
@@ -43,6 +48,17 @@ class SpecDecodingStats:
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
 
+    def add_phase_times(self, phase_times: dict[str, float]):
+        """Merge CUDA-event phase times into this stats object."""
+        self.target_forward_time_s += phase_times.get("target_forward", 0.0)
+        self.draft_time_s += phase_times.get("draft", 0.0)
+        self.scoring_time_s += phase_times.get("scoring", 0.0)
+        # logger.info(
+        #     "Added phase times to stats: target=%.3fs draft=%.3fs scoring=%.3fs",
+        #     self.target_forward_time_s,
+        #     self.draft_time_s,
+        #     self.scoring_time_s,
+        # )
 
 class SpecDecodingLogging:
     """Aggregate and log spec decoding metrics.
@@ -147,6 +163,18 @@ class SpecDecodingProm:
         per_engine_labelvalues: dict[int, list[object]],
     ):
         self.spec_decoding_enabled = speculative_config is not None
+
+        # Always register the target-forward timer so it is
+        # available in baseline (no spec-decode) mode too.
+        counter_target_fwd = self._counter_cls(
+            name="vllm:spec_decode_target_forward_time_seconds",
+            documentation="Cumulative target-model forward time (s).",
+            labelnames=labelnames,
+        )
+        self.counter_target_forward_time = make_per_engine(
+            counter_target_fwd, per_engine_labelvalues
+        )
+
         if not self.spec_decoding_enabled:
             return
 
@@ -177,6 +205,27 @@ class SpecDecodingProm:
             counter_accepted_tokens, per_engine_labelvalues
         )
 
+        # Phase-timing counters (seconds, from CUDA events).
+        # NOTE: counter_target_forward_time is registered unconditionally
+        # above (before the spec_decoding_enabled guard) so it works in
+        # baseline mode too.
+        counter_draft = self._counter_cls(
+            name="vllm:spec_decode_draft_time_seconds",
+            documentation="Cumulative drafter time (s).",
+            labelnames=labelnames,
+        )
+        self.counter_draft_time = make_per_engine(
+            counter_draft, per_engine_labelvalues
+        )
+        counter_scoring = self._counter_cls(
+            name="vllm:spec_decode_scoring_time_seconds",
+            documentation="Cumulative scoring/verification time (s).",
+            labelnames=labelnames,
+        )
+        self.counter_scoring_time = make_per_engine(
+            counter_scoring, per_engine_labelvalues
+        )
+
         assert speculative_config is not None
         num_spec_tokens = (
             speculative_config.num_speculative_tokens
@@ -197,6 +246,10 @@ class SpecDecodingProm:
         }
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
+        # Always record target-forward time (works in baseline too).
+        self.counter_target_forward_time[engine_idx].inc(
+            spec_decoding_stats.target_forward_time_s
+        )
         if not self.spec_decoding_enabled:
             return
         self.counter_spec_decode_num_drafts[engine_idx].inc(
@@ -212,6 +265,15 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+
+        # Phase timing counters (draft & scoring are spec-decode only;
+        # target_forward is already incremented above).
+        self.counter_draft_time[engine_idx].inc(
+            spec_decoding_stats.draft_time_s
+        )
+        self.counter_scoring_time[engine_idx].inc(
+            spec_decoding_stats.scoring_time_s
+        )
 
 
 def make_per_engine(

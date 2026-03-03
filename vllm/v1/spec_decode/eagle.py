@@ -27,6 +27,13 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX
+
+try:
+    import nvtx
+except ImportError:
+    nvtx = None
+
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -367,6 +374,7 @@ class SpecDecodeBaseProposer:
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):
             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
+            # eagle_cudagraph_mode = CUDAGraphMode.FULL
         else:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
@@ -391,6 +399,11 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        if nvtx:
+            if SYNC_BEFORE_NVTX:
+                torch.cuda.synchronize()
+            nvtx.push_range("spec_decode_draft")
+        
         batch_size = common_attn_metadata.batch_size()
 
         if self.method == "eagle3":
@@ -499,6 +512,10 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             draft_token_ids = logits.argmax(dim=-1)
+            if nvtx:
+                if SYNC_BEFORE_NVTX:
+                    torch.cuda.synchronize()
+                nvtx.pop_range()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -526,6 +543,10 @@ class SpecDecodeBaseProposer:
                 slot_mappings=slot_mappings,
             )
             # [batch_size, num_tree_tokens]
+            if nvtx:
+                if SYNC_BEFORE_NVTX:
+                    torch.cuda.synchronize()
+                nvtx.pop_range()
             return torch.cat(draft_token_ids_list, dim=1)
 
         draft_token_ids = logits.argmax(dim=-1)
@@ -699,6 +720,12 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        
+        if nvtx:
+            if SYNC_BEFORE_NVTX:
+                torch.cuda.synchronize()
+            nvtx.pop_range()
+        
         return draft_token_ids
 
     def set_inputs_first_pass(

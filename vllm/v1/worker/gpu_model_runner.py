@@ -24,6 +24,11 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX, PHASE_TIMING
+try:
+    import nvtx
+except ImportError:
+    nvtx = None
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
@@ -377,7 +382,7 @@ class GPUModelRunner(
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
-        # Broadcast PP output for external_launcher (torchrun)
+              # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
         # https://github.com/vllm-project/vllm/issues/18019
@@ -488,6 +493,20 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+
+        # Phase timing via CUDA events (async, minimal overhead).
+        # Enable for both baseline and spec-decode modes so that
+        # target_forward time is always accumulated.
+        self._phase_timing = PHASE_TIMING
+        if self._phase_timing:
+            self._ev_target_start = torch.cuda.Event(enable_timing=True)
+            self._ev_target_end = torch.cuda.Event(enable_timing=True)
+            if self.speculative_config is not None:
+                self._ev_scoring_start = torch.cuda.Event(enable_timing=True)
+                self._ev_scoring_end = torch.cuda.Event(enable_timing=True)
+                self._ev_draft_start = torch.cuda.Event(enable_timing=True)
+                self._ev_draft_end = torch.cuda.Event(enable_timing=True)
+            self._draft_timed = False
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -709,6 +728,8 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+        # user defined
+        self._nvtx_spec_iter_open = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3314,6 +3335,16 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if (nvtx
+                and not self._nvtx_spec_iter_open
+                and self.num_spec_tokens
+                and get_pp_group().is_last_rank
+            ):
+                nvtx.push_range(f"spec_decode_iter_L{self.num_spec_tokens}")
+                self._nvtx_spec_iter_open = True
+
+        
+        
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3379,6 +3410,9 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+
+            
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -3520,28 +3554,43 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        if nvtx:
+            if SYNC_BEFORE_NVTX:
+                torch.cuda.synchronize()
+            nvtx.push_range("target_model_forward")
+        
+        try:
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            ):
+                if self._phase_timing:
+                    self._ev_target_start.record()
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                if self._phase_timing:
+                    self._ev_target_end.record()
+        finally:
+            if nvtx:
+                if SYNC_BEFORE_NVTX:
+                    torch.cuda.synchronize()
+                nvtx.pop_range()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3617,6 +3666,7 @@ class GPUModelRunner(
         self.kv_connector_output = kv_connector_output
         return None
 
+    
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -3663,7 +3713,11 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            if self._phase_timing and spec_decode_metadata is not None:
+                self._ev_scoring_start.record()
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if self._phase_timing and spec_decode_metadata is not None:
+                self._ev_scoring_end.record()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -3685,6 +3739,8 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                if self._phase_timing:
+                    self._ev_draft_start.record()
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -3697,6 +3753,9 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                if self._phase_timing:
+                    self._ev_draft_end.record()
+                    self._draft_timed = True
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -3772,6 +3831,51 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # Compute spec decode phase times from CUDA events.
+            spec_decode_phase_times = None
+            if self._phase_timing:
+                # Sync only on the last recorded event; all prior events
+                # in the same stream are guaranteed complete.
+                if self._draft_timed:
+                    self._ev_draft_end.synchronize()
+                elif spec_decode_metadata is not None:
+                    self._ev_scoring_end.synchronize()
+                else:
+                    self._ev_target_end.synchronize()
+                # we sync on only scoring since it is the last step that will be scheduled and 
+                # # all prior events target and draft would have been completed
+                # # This will ensure that scoring time is not lost
+                # self._ev_scoring_end.synchronize()
+
+
+                spec_decode_phase_times = {
+                    "target_forward": (
+                        self._ev_target_start.elapsed_time(
+                            self._ev_target_end) / 1.000
+                    ),
+                }
+                if spec_decode_metadata is not None:
+                    spec_decode_phase_times["scoring"] = (
+                        self._ev_scoring_start.elapsed_time(
+                            self._ev_scoring_end) / 1.000
+                    )
+                if self._draft_timed:
+                    spec_decode_phase_times["draft"] = (
+                        self._ev_draft_start.elapsed_time(
+                            self._ev_draft_end) / 1.000
+                    )
+                    self._draft_timed = False
+
+                # if spec_decode_phase_times:
+                #     _t = spec_decode_phase_times.get("target_forward", 0) * 1000
+                #     _s = spec_decode_phase_times.get("scoring", 0) * 1000
+                #     _d = spec_decode_phase_times.get("draft", 0) * 1000
+                #     logger.info(
+                #         "PHASE_TIMING: target=%.1fms scoring=%.3fms draft=%.1fms keys=%s",
+                #         _t, _s, _d,
+                #         list(spec_decode_phase_times.keys()),
+                #     )
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3784,9 +3888,15 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                spec_decode_phase_times=spec_decode_phase_times,
             )
 
         if not self.use_async_scheduling:
+            if nvtx and self._nvtx_spec_iter_open:
+                if SYNC_BEFORE_NVTX:
+                    torch.cuda.synchronize()
+                nvtx.pop_range()
+                self._nvtx_spec_iter_open = False
             return output
 
         with record_function_or_nullcontext(
@@ -3809,7 +3919,11 @@ class GPUModelRunner(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
-
+        if nvtx and self._nvtx_spec_iter_open:
+            if SYNC_BEFORE_NVTX:
+                torch.cuda.synchronize()
+            nvtx.pop_range()
+            self._nvtx_spec_iter_open = False
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -3856,6 +3970,7 @@ class GPUModelRunner(
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
+
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -4882,19 +4997,39 @@ class GPUModelRunner(
             ):
                 assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
-                use_cudagraphs = (
-                    (
-                        is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-                    )
-                    or (
-                        not is_graph_capturing
-                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
-                    )
-                ) and not self.speculative_config.enforce_eager
+                # Eagle only supports PIECEWISE cudagraphs due to
+                # hidden state transfer and tree attention constraints.
+                # Separate draft models can use FULL cudagraphs.
+                if isinstance(self.drafter, DraftModelProposer):
+                    # Draft models support FULL cudagraphs
+                    use_cudagraphs = (
+                        (
+                            is_graph_capturing
+                            and cudagraph_runtime_mode
+                            in (CUDAGraphMode.PIECEWISE,
+                                CUDAGraphMode.FULL)
+                        )
+                        or (
+                            not is_graph_capturing
+                            and cudagraph_runtime_mode
+                            != CUDAGraphMode.NONE
+                        )
+                    ) and not self.speculative_config.enforce_eager
+                    
+                else:
+                    # Eagle: PIECEWISE only (as intended originally by vllm people)
+                    use_cudagraphs = (
+                        (
+                            is_graph_capturing
+                            and cudagraph_runtime_mode
+                            == CUDAGraphMode.PIECEWISE
+                        )
+                        or (
+                            not is_graph_capturing
+                            and cudagraph_runtime_mode
+                            != CUDAGraphMode.NONE
+                        )
+                    ) and not self.speculative_config.enforce_eager
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
@@ -5588,9 +5723,12 @@ class GPUModelRunner(
             cudagraph_mode, self.uniform_decode_query_len
         )
 
-        # Initialize eagle's cudagraph dispatcher if using eagle spec decode.
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+        # Initialize drafter's cudagraph dispatcher if using spec decode.
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()
+        ):
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
