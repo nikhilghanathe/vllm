@@ -39,6 +39,15 @@ class SpecDecodingStats:
     target_forward_time_s: float = 0.0
     draft_time_s: float = 0.0
     scoring_time_s: float = 0.0
+    comm_time_s: float = 0.0
+    comm_count: int = 0
+    # Per-phase communication breakdown.
+    comm_target_forward_time_s: float = 0.0
+    comm_target_forward_count: int = 0
+    comm_scoring_time_s: float = 0.0
+    comm_scoring_count: int = 0
+    comm_draft_time_s: float = 0.0
+    comm_draft_count: int = 0
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         self.num_drafts += 1
@@ -53,6 +62,21 @@ class SpecDecodingStats:
         self.target_forward_time_s += phase_times.get("target_forward", 0.0)
         self.draft_time_s += phase_times.get("draft", 0.0)
         self.scoring_time_s += phase_times.get("scoring", 0.0)
+        self.comm_time_s += phase_times.get("comm", 0.0)
+        self.comm_count += int(phase_times.get("comm_count", 0))
+        # Per-phase comm breakdown.
+        self.comm_target_forward_time_s += phase_times.get(
+            "comm_target_forward", 0.0)
+        self.comm_target_forward_count += int(phase_times.get(
+            "comm_target_forward_count", 0))
+        self.comm_scoring_time_s += phase_times.get(
+            "comm_scoring", 0.0)
+        self.comm_scoring_count += int(phase_times.get(
+            "comm_scoring_count", 0))
+        self.comm_draft_time_s += phase_times.get(
+            "comm_draft", 0.0)
+        self.comm_draft_count += int(phase_times.get(
+            "comm_draft_count", 0))
         # logger.info(
         #     "Added phase times to stats: target=%.3fs draft=%.3fs scoring=%.3fs",
         #     self.target_forward_time_s,
@@ -175,6 +199,41 @@ class SpecDecodingProm:
             counter_target_fwd, per_engine_labelvalues
         )
 
+        # Register comm counters unconditionally so they work in
+        # baseline (no spec-decode) mode too.
+        counter_comm = self._counter_cls(
+            name="vllm:spec_decode_comm_time_seconds",
+            documentation="Cumulative TP allreduce communication time (s).",
+            labelnames=labelnames,
+        )
+        self.counter_comm_time = make_per_engine(
+            counter_comm, per_engine_labelvalues
+        )
+        counter_comm_count = self._counter_cls(
+            name="vllm:spec_decode_comm_count",
+            documentation="Total number of TP allreduce calls.",
+            labelnames=labelnames,
+        )
+        self.counter_comm_count = make_per_engine(
+            counter_comm_count, per_engine_labelvalues
+        )
+        # Per-phase comm counters.
+        for phase in ("target_forward", "scoring", "draft"):
+            ctr_time = self._counter_cls(
+                name=f"vllm:spec_decode_comm_{phase}_time_seconds",
+                documentation=f"Cumulative TP allreduce time during {phase} (s).",
+                labelnames=labelnames,
+            )
+            setattr(self, f"counter_comm_{phase}_time",
+                    make_per_engine(ctr_time, per_engine_labelvalues))
+            ctr_cnt = self._counter_cls(
+                name=f"vllm:spec_decode_comm_{phase}_count",
+                documentation=f"Number of TP allreduce calls during {phase}.",
+                labelnames=labelnames,
+            )
+            setattr(self, f"counter_comm_{phase}_count",
+                    make_per_engine(ctr_cnt, per_engine_labelvalues))
+
         if not self.spec_decoding_enabled:
             return
 
@@ -206,9 +265,8 @@ class SpecDecodingProm:
         )
 
         # Phase-timing counters (seconds, from CUDA events).
-        # NOTE: counter_target_forward_time is registered unconditionally
-        # above (before the spec_decoding_enabled guard) so it works in
-        # baseline mode too.
+        # NOTE: counter_target_forward_time and comm counters are
+        # registered unconditionally above.
         counter_draft = self._counter_cls(
             name="vllm:spec_decode_draft_time_seconds",
             documentation="Cumulative drafter time (s).",
@@ -246,10 +304,24 @@ class SpecDecodingProm:
         }
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
-        # Always record target-forward time (works in baseline too).
+        # Always record target-forward time and comm timing
+        # (works in baseline too).
         self.counter_target_forward_time[engine_idx].inc(
             spec_decoding_stats.target_forward_time_s
         )
+        self.counter_comm_time[engine_idx].inc(
+            spec_decoding_stats.comm_time_s
+        )
+        self.counter_comm_count[engine_idx].inc(
+            spec_decoding_stats.comm_count
+        )
+        for phase in ("target_forward", "scoring", "draft"):
+            getattr(self, f"counter_comm_{phase}_time")[engine_idx].inc(
+                getattr(spec_decoding_stats, f"comm_{phase}_time_s")
+            )
+            getattr(self, f"counter_comm_{phase}_count")[engine_idx].inc(
+                getattr(spec_decoding_stats, f"comm_{phase}_count")
+            )
         if not self.spec_decoding_enabled:
             return
         self.counter_spec_decode_num_drafts[engine_idx].inc(
@@ -274,6 +346,8 @@ class SpecDecodingProm:
         self.counter_scoring_time[engine_idx].inc(
             spec_decoding_stats.scoring_time_s
         )
+        # NOTE: comm counters are incremented above (before the
+        # spec_decoding_enabled guard) so they work in baseline too.
 
 
 def make_per_engine(

@@ -1524,6 +1524,11 @@ def model_parallel_is_initialized():
 _TP_STATE_PATCHED = False
 
 
+def _is_tp_patched() -> bool:
+    """Return True if the TP group is currently patched."""
+    return _TP_STATE_PATCHED
+
+
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     """Patch the tp group temporarily until this function ends.

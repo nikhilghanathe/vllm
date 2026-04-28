@@ -161,8 +161,19 @@ def create_vllm_config_for_draft_model(
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
     old_spec_config = old.speculative_config
+    draft_tp = old_spec_config.draft_parallel_config.tensor_parallel_size
+    target_tp = old.parallel_config.tensor_parallel_size
+
+    # Always preserve the original rank for cache-path uniqueness.
+    # In replicated mode (draft_tp=1), the TP group patch makes the model
+    # loader see rank_in_group=0 via get_tensor_model_parallel_rank(),
+    # which correctly loads full (unsharded) weights. But parallel_config.rank
+    # is used by torch.compile cache paths (rank_{R}_{dp}/draft_model/),
+    # so it must stay unique per process to avoid write races.
+    draft_rank = old.parallel_config.rank
+
     new_parallel_config = replace(
-        old_spec_config.draft_parallel_config, rank=old.parallel_config.rank
+        old_spec_config.draft_parallel_config, rank=draft_rank
     )
     new: VllmConfig = replace(
         old,

@@ -127,6 +127,14 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    single_gpu_draft: bool = False
+    """When draft_tensor_parallel_size=1 and tensor_parallel_size>1, load
+    the draft model on only one GPU (TP rank 0) instead of replicating it
+    on every GPU. After drafting, rank 0 broadcasts the draft token IDs to
+    all other ranks. This saves ~(draft_model_size) of GPU memory on every
+    non-draft rank, at the cost of other ranks being idle during drafting.
+    Only applies to the draft_model method with draft_tp=1."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""

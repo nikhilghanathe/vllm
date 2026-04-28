@@ -128,6 +128,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
     def all_reduce(self, input_):
+        from vllm.v1.spec_decode import comm_timer
+
+        timing = comm_timer.is_enabled()
+        if timing:
+            start_ev = comm_timer.record_pre()
+
+        out = self._all_reduce_impl(input_)
+
+        if timing:
+            comm_timer.record_post(start_ev)
+
+        return out
+
+    def _all_reduce_impl(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(

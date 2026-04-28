@@ -25,6 +25,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX, PHASE_TIMING
+from vllm.v1.spec_decode import comm_timer as _comm_timer
 try:
     import nvtx
 except ImportError:
@@ -507,6 +508,7 @@ class GPUModelRunner(
                 self._ev_draft_start = torch.cuda.Event(enable_timing=True)
                 self._ev_draft_end = torch.cuda.Event(enable_timing=True)
             self._draft_timed = False
+            _comm_timer.enable()
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -3576,6 +3578,8 @@ class GPUModelRunner(
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
                 if self._phase_timing:
+                    _comm_timer.reset()
+                    _comm_timer.set_phase("target_forward")
                     self._ev_target_start.record()
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -3714,6 +3718,7 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             if self._phase_timing and spec_decode_metadata is not None:
+                _comm_timer.set_phase("scoring")
                 self._ev_scoring_start.record()
             sampler_output = self._sample(logits, spec_decode_metadata)
             if self._phase_timing and spec_decode_metadata is not None:
@@ -3740,6 +3745,7 @@ class GPUModelRunner(
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 if self._phase_timing:
+                    _comm_timer.set_phase("draft")
                     self._ev_draft_start.record()
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -3865,6 +3871,18 @@ class GPUModelRunner(
                             self._ev_draft_end) / 1.000
                     )
                     self._draft_timed = False
+
+                # Per-phase TP allreduce comm time.
+                comm_ms = _comm_timer.elapsed_ms_per_phase()
+                comm_cnt = _comm_timer.count_per_phase()
+                for phase in ("target_forward", "scoring", "draft"):
+                    spec_decode_phase_times[f"comm_{phase}"] = (
+                        comm_ms.get(phase, 0.0))
+                    spec_decode_phase_times[f"comm_{phase}_count"] = float(
+                        comm_cnt.get(phase, 0))
+                spec_decode_phase_times["comm"] = _comm_timer.elapsed_ms()
+                spec_decode_phase_times["comm_count"] = float(
+                    _comm_timer.total_count())
 
                 # if spec_decode_phase_times:
                 #     _t = spec_decode_phase_times.get("target_forward", 0) * 1000
