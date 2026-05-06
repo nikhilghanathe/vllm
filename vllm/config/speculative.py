@@ -108,6 +108,12 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    no_bonus_token: bool = False
+    """When True, discard the bonus token that the target model produces when
+    all draft tokens are accepted. Only the L draft tokens themselves are
+    counted; the extra target sample conditioned on the complete draft
+    context is thrown away. Useful for isolating the contribution of draft
+    acceptance vs. the bonus token when analysing acceptance-length metrics."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -134,6 +140,16 @@ class SpeculativeConfig:
     all other ranks. This saves ~(draft_model_size) of GPU memory on every
     non-draft rank, at the cost of other ranks being idle during drafting.
     Only applies to the draft_model method with draft_tp=1."""
+
+    cross_vocab_method: str | None = None
+    """Cross-vocabulary speculative decoding method. Currently supported:
+    - "tli": Token Level Intersection. Computes the shared vocabulary
+      between draft and target tokenizers and restricts logits to this
+      intersection during drafting and verification. Enables using a
+      draft model with a different tokenizer/vocabulary than the target.
+    When set, the vocab-size equality check is skipped and the draft
+    model uses its own tokenizer instead of the target's.
+    Default is None (disabled — standard same-vocab behaviour)."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -386,11 +402,24 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                # When TLI is enabled, the draft model uses its own
+                # tokenizer so that token-ID ↔ string mappings are
+                # correct for intersection computation.  Otherwise
+                # (default) we reuse the target's tokenizer.
+                if self.cross_vocab_method == "tli":
+                    draft_tokenizer = self.model
+                    draft_tokenizer_mode = "auto"
+                else:
+                    draft_tokenizer = self.target_model_config.tokenizer
+                    draft_tokenizer_mode = (
+                        self.target_model_config.tokenizer_mode
+                    )
+
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
-                    tokenizer=self.target_model_config.tokenizer,
-                    tokenizer_mode=self.target_model_config.tokenizer_mode,
+                    tokenizer=draft_tokenizer,
+                    tokenizer_mode=draft_tokenizer_mode,
                     trust_remote_code=self.target_model_config.trust_remote_code,
                     allowed_local_media_path=self.target_model_config.allowed_local_media_path,
                     allowed_media_domains=self.target_model_config.allowed_media_domains,
@@ -730,6 +759,11 @@ class SpeculativeConfig:
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
+        # When TLI is enabled, vocab sizes are expected to differ —
+        # the intersection mapping handles the translation.
+        if self.cross_vocab_method == "tli":
+            return
+
         if (
             self.method == "draft_model"
             and self.target_model_config is not None
@@ -743,7 +777,9 @@ class SpeculativeConfig:
                     f"Target model vocab_size={target_vocab_size}. "
                     f"Draft model vocab_size={draft_vocab_size}. "
                     f"Using models with different tokenizers can cause out-of-bounds "
-                    f"errors during speculative decoding."
+                    f"errors during speculative decoding. "
+                    f"Set cross_vocab_method='tli' to enable cross-vocabulary "
+                    f"speculative decoding via Token Level Intersection."
                 )
 
     def use_eagle(self) -> bool:

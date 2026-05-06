@@ -26,6 +26,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX, PHASE_TIMING
 from vllm.v1.spec_decode import comm_timer as _comm_timer
+from vllm.v1.spec_decode import tli_timer as _tli_timer
 try:
     import nvtx
 except ImportError:
@@ -509,6 +510,10 @@ class GPUModelRunner(
                 self._ev_draft_end = torch.cuda.Event(enable_timing=True)
             self._draft_timed = False
             _comm_timer.enable()
+            if (self.speculative_config is not None and
+                    getattr(self.speculative_config,
+                            'cross_vocab_method', None) == "tli"):
+                _tli_timer.enable()
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1894,6 +1899,10 @@ class GPUModelRunner(
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
+                elif (isinstance(self.drafter, DraftModelProposer)
+                      and self.drafter.attn_layer_names):
+                    if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
+                        spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
 
@@ -2898,6 +2907,14 @@ class GPUModelRunner(
             None,  # draft_probs
             logits,
             sampling_metadata,
+            # TLI cross-vocab: pass the target intersection mask so the
+            # rejection sampler restricts target logits to shared tokens.
+            target_vocab_mask=(
+                self.drafter.tli.target_mask
+                if isinstance(self.drafter, DraftModelProposer)
+                and self.drafter.tli is not None
+                else None
+            ),
         )
         return sampler_output
 
@@ -3579,6 +3596,8 @@ class GPUModelRunner(
             ):
                 if self._phase_timing:
                     _comm_timer.reset()
+                    if _tli_timer.is_enabled():
+                        _tli_timer.reset()
                     _comm_timer.set_phase("target_forward")
                     self._ev_target_start.record()
                 model_output = self._model_forward(
@@ -3883,6 +3902,14 @@ class GPUModelRunner(
                 spec_decode_phase_times["comm"] = _comm_timer.elapsed_ms()
                 spec_decode_phase_times["comm_count"] = float(
                     _comm_timer.total_count())
+
+                # TLI per-op overhead (only when cross-vocab TLI is active).
+                if _tli_timer.is_enabled():
+                    tli_ms = _tli_timer.elapsed_ms_per_op()
+                    for op in ("draft_mask", "draft_remap",
+                               "target_remap", "target_mask"):
+                        spec_decode_phase_times[f"tli_{op}"] = (
+                            tli_ms.get(op, 0.0))
 
                 # if spec_decode_phase_times:
                 #     _t = spec_decode_phase_times.get("target_forward", 0) * 1000

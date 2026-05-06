@@ -128,10 +128,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculative_config is not None:
             self.do_spec_decode = True
             self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+            self.no_bonus_token = self.speculative_config.no_bonus_token
             self.speculator = init_speculator(self.vllm_config, self.device)
         else:
             self.do_spec_decode = False
             self.num_speculative_steps = 0
+            self.no_bonus_token = False
             self.speculator = None
 
         self.req_states = RequestState(
@@ -727,6 +729,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.num_speculative_steps,
             )
             sampler_output.sampled_token_ids = sampled_tokens
+            if self.no_bonus_token:
+                # Cap each request's accepted count to its draft token count,
+                # excluding the bonus token the target adds when all drafts
+                # are accepted. cu_num_logits includes one slot for the bonus,
+                # so num_draft = (end - start) - 1 per request.
+                num_draft_per_req = torch.diff(
+                    input_batch.cu_num_logits
+                ).to(dtype=torch.int32) - 1
+                num_sampled = torch.minimum(num_sampled, num_draft_per_req)
 
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.

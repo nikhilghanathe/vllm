@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.token_intersection import TokenLevelIntersection
 from vllm.v1.spec_decode.utils import create_vllm_config_for_draft_model
 from vllm.config import (
     CUDAGraphMode,
@@ -59,9 +60,75 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         )
         self._raise_if_vocab_size_mismatch()
         self._validate_and_setup_draft_tp()
+        self._setup_tli(device)
 
     def _raise_if_vocab_size_mismatch(self):
         self.speculative_config.verify_equal_vocab_size_if_draft_model()
+
+    def _setup_tli(self, device: torch.device):
+        """Initialize Token Level Intersection when cross_vocab_method='tli'.
+
+        This is a no-op when TLI is not configured.  When enabled, it:
+        1. Builds the intersection mapping between draft & target vocabs.
+        2. Monkey-patches ``self.model.compute_logits`` so that draft
+           logits are masked to the intersection vocabulary *before*
+           the base-class ``propose()`` calls ``argmax``.
+        """
+        self.tli: TokenLevelIntersection | None = None
+
+        if self.speculative_config.cross_vocab_method != "tli":
+            return
+
+        draft_vocab_size = (
+            self.speculative_config.draft_model_config.get_vocab_size()
+        )
+        target_vocab_size = (
+            self.speculative_config.target_model_config.get_vocab_size()
+        )
+        draft_tokenizer_name = self.speculative_config.model
+        target_tokenizer_name = (
+            self.speculative_config.target_model_config.tokenizer
+        )
+
+        self.tli = TokenLevelIntersection(
+            draft_tokenizer_name=draft_tokenizer_name,
+            target_tokenizer_name=target_tokenizer_name,
+            draft_vocab_size=draft_vocab_size,
+            target_vocab_size=target_vocab_size,
+            device=device,
+        )
+
+        # NOTE: the compute_logits monkey-patch is deferred to
+        # load_model() because self.model does not exist yet during
+        # __init__.
+
+    def _patch_compute_logits_for_tli(self):
+        """Monkey-patch compute_logits to mask draft logits to the
+        intersection vocabulary.  Must be called after load_model()
+        so that self.model exists."""
+        if self.tli is None:
+            return
+
+        # Cast the draft mask to match the model's compute dtype so the
+        # in-place addition below stays in bfloat16/float16 rather than
+        # promoting to float32 (which would allocate a new float32 tensor).
+        try:
+            model_dtype = next(iter(self.model.parameters())).dtype
+            self.tli.draft_mask = self.tli.draft_mask.to(model_dtype)
+        except StopIteration:
+            pass  # no parameters (unusual); keep float32 mask
+
+        original_compute_logits = self.model.compute_logits
+        tli_ref = self.tli
+
+        def _tli_compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+            logits = original_compute_logits(hidden_states)
+            # In-place add: logits is a fresh tensor from compute_logits;
+            # mask dtype already matches, so no type promotion or allocation.
+            logits += tli_ref.draft_mask
+            return logits
+
+        self.model.compute_logits = _tli_compute_logits  # type: ignore[method-assign]
 
     def _validate_and_setup_draft_tp(self):
         """Validate draft/target TP sizes and create a self-only TP group
@@ -151,10 +218,21 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # so we load them with a modified vllm config.
         # In replicated mode (draft_tp=1), we patch the TP group so the
         # model loader sees world_size=1 and loads all weights (no sharding).
+        #
+        # IMPORTANT: the model tag is used as the torch.compile cache
+        # subdirectory name. Different draft TP sizes shard lm_head/
+        # embed_tokens differently (e.g. [151936,2048] at tp=1 vs
+        # [75968,2048] at tp=2), so they MUST use separate cache dirs.
+        # Without the tp suffix, a cached kernel compiled for tp=1
+        # bakes in assert_size_stride(..., (151936, 2048), ...) and
+        # crashes when reloaded for tp=2 where the weight is (75968, 2048).
         from vllm.compilation.backends import set_model_tag
 
+        draft_tp = self.speculative_config.draft_parallel_config.tensor_parallel_size
+        model_tag = f"draft_model_tp{draft_tp}"
+
         temp_vllm_config = create_vllm_config_for_draft_model(self.vllm_config)
-        with self._maybe_patch_tp(), set_model_tag("draft_model"):
+        with self._maybe_patch_tp(), set_model_tag(model_tag):
             model = get_model(
                 vllm_config=temp_vllm_config,
                 prefix="draft_model",
@@ -180,8 +258,12 @@ class DraftModelProposer(SpecDecodeBaseProposer):
     @override
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
         """Skip validation on non-draft ranks where the draft model
-        was not loaded and attn_layer_names is empty."""
+        was not loaded and attn_layer_names is empty.
+        Also skip when TLI is active — the draft model has a completely
+        different architecture and its own independent KV cache."""
         if not self._is_draft_rank:
+            return
+        if self.tli is not None:
             return
         super().validate_same_kv_cache_group(kv_cache_config)
 
@@ -189,10 +271,35 @@ class DraftModelProposer(SpecDecodeBaseProposer):
     def propose(self, *args, **kwargs) -> torch.Tensor:
         """Override propose to patch TP group for replicated draft.
         In single-GPU mode, only rank 0 runs the draft model and
-        broadcasts the result to other ranks."""
+        broadcasts the result to other ranks.
+
+        When TLI is enabled, the returned token IDs are remapped from
+        draft-vocabulary space to target-vocabulary space so that the
+        target model can consume them directly."""
+        # TLI: remap incoming target-vocab token IDs → draft-vocab IDs
+        # before they enter the draft model's embedding layer.
+        # Mapping tables are int32, matching the token ID dtype in vLLM,
+        # so no .to() cast is needed.
+        if self.tli is not None:
+            if 'next_token_ids' in kwargs:
+                kwargs['next_token_ids'] = self.tli.target_ids_to_draft(
+                    kwargs['next_token_ids'])
+            elif len(args) > 3:
+                args = list(args)
+                args[3] = self.tli.target_ids_to_draft(args[3])
+                args = tuple(args)
+            if 'target_token_ids' in kwargs:
+                kwargs['target_token_ids'] = self.tli.target_ids_to_draft(
+                    kwargs['target_token_ids'])
+            elif len(args) > 0:
+                args = list(args)
+                args[0] = self.tli.target_ids_to_draft(args[0])
+                args = tuple(args)
+
         if not self._single_gpu_draft:
             with self._maybe_patch_tp():
-                return super().propose(*args, **kwargs)
+                draft_token_ids = super().propose(*args, **kwargs)
+            return self._maybe_remap_to_target(draft_token_ids)
 
         # Single-GPU draft: only rank 0 runs propose.
         tp_group = get_tp_group()
@@ -222,6 +329,17 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         if timing:
             comm_timer.record_post(start_ev)
 
+        return self._maybe_remap_to_target(draft_token_ids)
+
+    def _maybe_remap_to_target(
+        self, draft_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Remap draft token IDs to target vocab space when TLI is active.
+
+        This is a no-op when TLI is not configured."""
+        if self.tli is not None:
+            # Mapping table is int32, same dtype as draft_token_ids — no cast.
+            draft_token_ids = self.tli.draft_ids_to_target(draft_token_ids)
         return draft_token_ids
 
     @override
@@ -291,6 +409,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             return
         with self._maybe_patch_tp():
             super().load_model(target_model)
+        self._patch_compute_logits_for_tli()
         # NOTE: We do NOT wrap with CUDAGraphWrapper here.
         # CUDAGraphWrapper is for FULL CUDA graphs, but the drafter
         # uses PIECEWISE (see initialize_cudagraph_keys comment).

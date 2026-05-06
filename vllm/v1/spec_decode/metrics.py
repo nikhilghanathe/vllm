@@ -48,6 +48,11 @@ class SpecDecodingStats:
     comm_scoring_count: int = 0
     comm_draft_time_s: float = 0.0
     comm_draft_count: int = 0
+    # TLI (Token Level Intersection) per-op overhead (ms stored in _s fields).
+    tli_draft_mask_time_s: float = 0.0
+    tli_draft_remap_time_s: float = 0.0
+    tli_target_remap_time_s: float = 0.0
+    tli_target_mask_time_s: float = 0.0
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         self.num_drafts += 1
@@ -77,6 +82,12 @@ class SpecDecodingStats:
             "comm_draft", 0.0)
         self.comm_draft_count += int(phase_times.get(
             "comm_draft_count", 0))
+        # TLI per-op times.
+        self.tli_draft_mask_time_s += phase_times.get("tli_draft_mask", 0.0)
+        self.tli_draft_remap_time_s += phase_times.get("tli_draft_remap", 0.0)
+        self.tli_target_remap_time_s += phase_times.get(
+            "tli_target_remap", 0.0)
+        self.tli_target_mask_time_s += phase_times.get("tli_target_mask", 0.0)
         # logger.info(
         #     "Added phase times to stats: target=%.3fs draft=%.3fs scoring=%.3fs",
         #     self.target_forward_time_s,
@@ -187,6 +198,10 @@ class SpecDecodingProm:
         per_engine_labelvalues: dict[int, list[object]],
     ):
         self.spec_decoding_enabled = speculative_config is not None
+        self.tli_enabled = (
+            speculative_config is not None and
+            getattr(speculative_config, 'cross_vocab_method', None) == "tli"
+        )
 
         # Always register the target-forward timer so it is
         # available in baseline (no spec-decode) mode too.
@@ -284,6 +299,20 @@ class SpecDecodingProm:
             counter_scoring, per_engine_labelvalues
         )
 
+        # TLI per-op timing counters — only registered when TLI is active.
+        if self.tli_enabled:
+            for op in ("draft_mask", "draft_remap", "target_remap",
+                       "target_mask"):
+                ctr = self._counter_cls(
+                    name=f"vllm:spec_decode_tli_{op}_time_seconds",
+                    documentation=(
+                        f"Cumulative TLI {op} operation time (ms "
+                        f"accumulated as counter value)."),
+                    labelnames=labelnames,
+                )
+                setattr(self, f"counter_tli_{op}_time",
+                        make_per_engine(ctr, per_engine_labelvalues))
+
         assert speculative_config is not None
         num_spec_tokens = (
             speculative_config.num_speculative_tokens
@@ -348,6 +377,14 @@ class SpecDecodingProm:
         )
         # NOTE: comm counters are incremented above (before the
         # spec_decoding_enabled guard) so they work in baseline too.
+
+        # TLI per-op timing (only when TLI is active).
+        if self.tli_enabled:
+            for op in ("draft_mask", "draft_remap", "target_remap",
+                       "target_mask"):
+                getattr(self, f"counter_tli_{op}_time")[engine_idx].inc(
+                    getattr(spec_decoding_stats, f"tli_{op}_time_s")
+                )
 
 
 def make_per_engine(

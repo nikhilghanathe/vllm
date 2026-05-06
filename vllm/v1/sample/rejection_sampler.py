@@ -23,6 +23,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.SpecDecConfig_User import SYNC_BEFORE_NVTX
+from vllm.v1.spec_decode import tli_timer
 
 logger = init_logger(__name__)
 
@@ -71,6 +72,9 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        # [vocab_size] — optional additive mask for TLI cross-vocab.
+        # 0 for intersection tokens, -inf for others.
+        target_vocab_mask: torch.Tensor | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -89,6 +93,11 @@ class RejectionSampler(nn.Module):
             sampling_metadata (vllm.v1.sample.metadata.SamplingMetadata):
                 Additional metadata needed for sampling, such as temperature,
                 top-k/top-p parameters, or other relevant information.
+            target_vocab_mask (Optional[torch.Tensor]):
+                Additive mask to restrict target logits to the vocabulary
+                intersection with the draft model (TLI cross-vocab).
+                Shape is [vocab_size]. 0 for intersection tokens, -inf
+                for others. None when TLI is not active.
         Returns:
             SamplerOutput:
                 Contains the final output token IDs and their logprobs if
@@ -104,7 +113,17 @@ class RejectionSampler(nn.Module):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
+
+        # TLI cross-vocab: mask bonus logits to the intersection vocabulary
+        # so that the bonus token is sampled from the shared space.
         bonus_logits = logits[bonus_logits_indices]
+        if target_vocab_mask is not None:
+            if tli_timer.is_enabled():
+                _ev = tli_timer.record_start("target_mask")
+                bonus_logits = bonus_logits + target_vocab_mask
+                tli_timer.record_end("target_mask", _ev)
+            else:
+                bonus_logits = bonus_logits + target_vocab_mask
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -143,6 +162,16 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+
+        # TLI cross-vocab: mask target logits to the intersection vocabulary
+        # so that acceptance/rejection is evaluated over the shared space.
+        if target_vocab_mask is not None:
+            if tli_timer.is_enabled():
+                _ev = tli_timer.record_start("target_mask")
+                target_logits = target_logits + target_vocab_mask
+                tli_timer.record_end("target_mask", _ev)
+            else:
+                target_logits = target_logits + target_vocab_mask
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
