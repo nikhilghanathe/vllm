@@ -3873,13 +3873,16 @@ class GPUModelRunner(
                 # self._ev_scoring_end.synchronize()
 
 
-                spec_decode_phase_times = {
-                    "target_forward": (
+                spec_decode_phase_times = {}
+                # Only count target_forward on VERIFY steps (spec_decode_metadata
+                # present). Prefill / non-verify forwards are excluded so
+                # target_forward measures verification latency, not prefill.
+                # (Prefill timing is available via request_prefill_time_seconds.)
+                if spec_decode_metadata is not None:
+                    spec_decode_phase_times["target_forward"] = (
                         self._ev_target_start.elapsed_time(
                             self._ev_target_end) / 1.000
-                    ),
-                }
-                if spec_decode_metadata is not None:
+                    )
                     spec_decode_phase_times["scoring"] = (
                         self._ev_scoring_start.elapsed_time(
                             self._ev_scoring_end) / 1.000

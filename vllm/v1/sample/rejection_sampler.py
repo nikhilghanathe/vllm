@@ -184,6 +184,15 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        # SpecProbe: join target-side stats + acceptance with the draft-side
+        # distribution captured during propose(). No-op unless VLLM_SPEC_PROBE
+        # is set. Uses target_logits (the verification distribution) over all
+        # speculated positions, including rejected ones.
+        from vllm.v1.spec_decode import spec_probe
+        _probe = spec_probe.get_probe()
+        if _probe.enabled and _probe.draft_active:
+            _probe.capture_verification(metadata, target_logits, output_token_ids)
+
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(

@@ -130,6 +130,27 @@ class DraftModelProposer(SpecDecodeBaseProposer):
 
         self.model.compute_logits = _tli_compute_logits  # type: ignore[method-assign]
 
+    def _patch_compute_logits_for_probe(self):
+        """Wrap compute_logits to capture per-step draft distribution stats
+        for the SpecProbe analysis instrument. No-op unless VLLM_SPEC_PROBE
+        is set. Wraps whatever compute_logits exists (after the TLI patch),
+        so probe + TLI compose."""
+        from vllm.v1.spec_decode import spec_probe
+        probe = spec_probe.get_probe()
+        if not probe.enabled:
+            return
+        probe.set_rank(self._tp_rank)
+        probe.arm()
+
+        original_compute_logits = self.model.compute_logits
+
+        def _probe_compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+            logits = original_compute_logits(hidden_states)
+            probe.record_draft_step(logits)
+            return logits
+
+        self.model.compute_logits = _probe_compute_logits  # type: ignore[method-assign]
+
     def _validate_and_setup_draft_tp(self):
         """Validate draft/target TP sizes and create a self-only TP group
         for replicated draft mode (draft_tp=1, target_tp>1).
@@ -296,10 +317,16 @@ class DraftModelProposer(SpecDecodeBaseProposer):
                 args[0] = self.tli.target_ids_to_draft(args[0])
                 args = tuple(args)
 
+        from vllm.v1.spec_decode import spec_probe
+        probe = spec_probe.get_probe()
+
         if not self._single_gpu_draft:
+            probe.begin_draft()
             with self._maybe_patch_tp():
                 draft_token_ids = super().propose(*args, **kwargs)
-            return self._maybe_remap_to_target(draft_token_ids)
+            remapped = self._maybe_remap_to_target(draft_token_ids)
+            probe.end_draft(remapped)
+            return remapped
 
         # Single-GPU draft: only rank 0 runs propose.
         tp_group = get_tp_group()
@@ -309,6 +336,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         batch_size = common_attn_metadata.batch_size()
 
         if self._is_draft_rank:
+            probe.begin_draft()
             with self._maybe_patch_tp():
                 draft_token_ids = super().propose(*args, **kwargs)
         else:
@@ -329,7 +357,11 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         if timing:
             comm_timer.record_post(start_ev)
 
-        return self._maybe_remap_to_target(draft_token_ids)
+        remapped = self._maybe_remap_to_target(draft_token_ids)
+        # Only the draft rank captured per-step stats; finalize there.
+        if self._is_draft_rank:
+            probe.end_draft(remapped)
+        return remapped
 
     def _maybe_remap_to_target(
         self, draft_token_ids: torch.Tensor
@@ -410,6 +442,9 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         with self._maybe_patch_tp():
             super().load_model(target_model)
         self._patch_compute_logits_for_tli()
+        # Probe wrapper goes LAST so it observes the final (TLI-masked)
+        # logits the proposer actually argmaxes over. No-op when disabled.
+        self._patch_compute_logits_for_probe()
         # NOTE: We do NOT wrap with CUDAGraphWrapper here.
         # CUDAGraphWrapper is for FULL CUDA graphs, but the drafter
         # uses PIECEWISE (see initialize_cudagraph_keys comment).

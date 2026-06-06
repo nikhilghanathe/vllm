@@ -27,6 +27,10 @@ class SpecDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    # Number of verify (decode-with-spec) steps. Per-STEP timing denominator:
+    # phase times accumulate once per step, while num_drafts counts per request
+    # per step (= batch_size x steps), so per-step means must divide by this.
+    num_verify_steps: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -64,6 +68,10 @@ class SpecDecodingStats:
 
     def add_phase_times(self, phase_times: dict[str, float]):
         """Merge CUDA-event phase times into this stats object."""
+        # target_forward is emitted only on verify steps (see gpu_model_runner),
+        # so its presence marks one verify step — the per-step timing denominator.
+        if "target_forward" in phase_times:
+            self.num_verify_steps += 1
         self.target_forward_time_s += phase_times.get("target_forward", 0.0)
         self.draft_time_s += phase_times.get("draft", 0.0)
         self.scoring_time_s += phase_times.get("scoring", 0.0)
@@ -214,6 +222,17 @@ class SpecDecodingProm:
             counter_target_fwd, per_engine_labelvalues
         )
 
+        # Number of verify steps — the correct per-step denominator for all
+        # phase-timing means (phase times accumulate once per step).
+        counter_verify_steps = self._counter_cls(
+            name="vllm:spec_decode_num_verify_steps",
+            documentation="Number of verify (decode-with-spec) steps.",
+            labelnames=labelnames,
+        )
+        self.counter_num_verify_steps = make_per_engine(
+            counter_verify_steps, per_engine_labelvalues
+        )
+
         # Register comm counters unconditionally so they work in
         # baseline (no spec-decode) mode too.
         counter_comm = self._counter_cls(
@@ -337,6 +356,9 @@ class SpecDecodingProm:
         # (works in baseline too).
         self.counter_target_forward_time[engine_idx].inc(
             spec_decoding_stats.target_forward_time_s
+        )
+        self.counter_num_verify_steps[engine_idx].inc(
+            spec_decoding_stats.num_verify_steps
         )
         self.counter_comm_time[engine_idx].inc(
             spec_decoding_stats.comm_time_s
