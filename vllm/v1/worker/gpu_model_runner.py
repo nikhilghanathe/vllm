@@ -3874,15 +3874,26 @@ class GPUModelRunner(
 
 
                 spec_decode_phase_times = {}
-                # Only count target_forward on VERIFY steps (spec_decode_metadata
-                # present). Prefill / non-verify forwards are excluded so
-                # target_forward measures verification latency, not prefill.
-                # (Prefill timing is available via request_prefill_time_seconds.)
-                if spec_decode_metadata is not None:
+                # Count target_forward on VERIFY steps (spec_decode_metadata
+                # present) and, in baseline (no speculative_config), on pure
+                # DECODE steps too, so a baseline run records target_forward via
+                # the identical CUDA-event timer for apples-to-apples speedup
+                # comparisons. Prefill is excluded in both modes: a decode step
+                # schedules exactly one token per request, so total scheduled
+                # tokens == number of requests. (Prefill timing remains available
+                # via request_prefill_time_seconds.)
+                _n_reqs = len(scheduler_output.num_scheduled_tokens)
+                _baseline_decode = (
+                    self.speculative_config is None
+                    and _n_reqs > 0
+                    and scheduler_output.total_num_scheduled_tokens == _n_reqs
+                )
+                if spec_decode_metadata is not None or _baseline_decode:
                     spec_decode_phase_times["target_forward"] = (
                         self._ev_target_start.elapsed_time(
                             self._ev_target_end) / 1.000
                     )
+                if spec_decode_metadata is not None:
                     spec_decode_phase_times["scoring"] = (
                         self._ev_scoring_start.elapsed_time(
                             self._ev_scoring_end) / 1.000
