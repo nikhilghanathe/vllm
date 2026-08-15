@@ -327,6 +327,13 @@ class ModelRunnerOutput:
 
     kv_connector_output: KVConnectorOutput | None = None
 
+    # Cumulative spec-decode phase timings from this worker's CUDA-event timer, as
+    # {phase: (total_ms, count)}. Empty unless VLLM_SPEC_PHASE_TIMING=1. Carried here
+    # because the timers live in the WORKER process while SpecDecodingStats is built in
+    # the scheduler; this is the existing channel between the two. Values are cumulative
+    # and read without a device sync, so attaching them every step is free.
+    spec_phase_timings: dict[str, tuple[float, int]] | None = None
+
     ec_connector_output: ECConnectorOutput | None = None
 
     # req_id -> num_nans_in_logits

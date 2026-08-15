@@ -1346,12 +1346,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
+            self.step_timing.scoring_start()
             sampler_output = self.rejection_sampler(
                 logits,
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
             )
+            self.step_timing.scoring_end()
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
@@ -1600,7 +1602,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         self.step_timing.record_batch(
-            input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+            input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL, dummy_run=dummy_run
         )
         self.step_timing.forward_start()
 
@@ -1658,6 +1660,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states = None
             aux_hidden_states = None
             output_intermediate_tensors = model_output
+
+        # Close the forward pair on the serving path. During profiling the dummy
+        # run closes it itself, after this returns, so this call no-ops there.
+        self.step_timing.forward_end_serving()
 
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
@@ -1799,6 +1805,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            self.step_timing.drafter_start()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1813,6 +1820,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            self.step_timing.drafter_end()
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(

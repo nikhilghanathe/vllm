@@ -186,6 +186,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.spec_decode import phase_timer as spec_phase_timer
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -3779,12 +3780,18 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            draft_probs,
-            logits,
-            sampling_metadata,
-        )
+        # "scoring" == rejection sampling: deciding which drafted tokens survive. Cheap
+        # for a chain draft (measured <0.5 ms in the SGLang equivalent), but a
+        # block/tree draft verifies far more candidates, so it must be measured rather
+        # than assumed negligible -- and if it were left unwrapped it would silently
+        # belong to neither draft nor target.
+        with spec_phase_timer.record("scoring"):
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -4559,13 +4566,36 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            # Opt-in CUDA-event timing (VLLM_SPEC_PHASE_TIMING=1); no-op otherwise.
+            #
+            # GATED ON STEP KIND -- this is load-bearing, not a refinement. _model_forward
+            # runs for PREFILL as well as verify/decode, and a prefill processes the whole
+            # prompt (~1.8k tokens here) against a verify step's B*(L+1). Timing both into
+            # one bucket makes target_forward_ms a blend of two different shapes and it
+            # stops meaning anything.
+            #
+            # Discriminator: a decode/verify step schedules exactly one token per request
+            # (plus drafts), so total_num_scheduled_tokens == num_requests for baseline
+            # decode; a prefill schedules many tokens per request. With speculation on,
+            # the presence of spec_decode_metadata marks the verify step directly.
+            #
+            # Kept OUTSIDE self.model so it stays valid with CUDA graphs on.
+            _n_reqs = len(scheduler_output.num_scheduled_tokens)
+            _is_verify = spec_decode_metadata is not None
+            _is_baseline_decode = (
+                self.speculative_config is None
+                and _n_reqs > 0
+                and scheduler_output.total_num_scheduled_tokens == _n_reqs
             )
+            _phase = "target_forward" if (_is_verify or _is_baseline_decode) else None
+            with spec_phase_timer.record_optional(_phase):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4887,6 +4917,9 @@ class GPUModelRunner(
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
                 else None,
+                # Cumulative, read without a device sync (see phase_timer.snapshot);
+                # empty dict unless VLLM_SPEC_PHASE_TIMING=1.
+                spec_phase_timings=spec_phase_timer.snapshot() or None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
@@ -5116,6 +5149,35 @@ class GPUModelRunner(
         return torch.cat(draft_probs_rows, dim=0).contiguous()
 
     def propose_draft_token_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ) -> list[list[int]] | torch.Tensor:
+        # Time the whole draft region, not each branch: this method funnels every
+        # proposer (ngram / custom_class / suffix / medusa / eagle / dspark ...), and
+        # there are four separate self.drafter.propose() call sites below. Instrumenting
+        # them individually would silently miss whichever branch a given method takes.
+        with spec_phase_timer.record("draft_forward"):
+            return self._propose_draft_token_ids_inner(
+                scheduler_output,
+                sampled_token_ids,
+                sampling_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                spec_decode_metadata,
+                common_attn_metadata,
+                slot_mappings,
+            )
+
+    def _propose_draft_token_ids_inner(
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: torch.Tensor | list[list[int]],

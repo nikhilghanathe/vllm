@@ -86,6 +86,9 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        # Latest cumulative spec-decode phase timings reported by the worker. None
+        # unless VLLM_SPEC_PHASE_TIMING=1 in the worker environment.
+        self._last_spec_phase_timings: dict[str, tuple[float, int]] | None = None
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -1741,6 +1744,10 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        # Stash for _update_spec_decoding_stats below. Cumulative per worker, so the
+        # latest value supersedes rather than adds.
+        if model_runner_output.spec_phase_timings:
+            self._last_spec_phase_timings = model_runner_output.spec_phase_timings
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
@@ -2635,6 +2642,7 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
+        spec_decoding_stats.observe_phase_timings(self._last_spec_phase_timings)
         return spec_decoding_stats
 
     def shutdown(self) -> None:

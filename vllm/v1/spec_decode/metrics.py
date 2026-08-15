@@ -30,6 +30,12 @@ class SpecDecodingStats:
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
 
+    # CUDA-event phase timings from the worker, as {phase: (total_ms, count)}. Phases:
+    # target_forward, draft_forward, scoring, and comm.<phase> for the TP all-reduce
+    # attributed to each. Cumulative per worker; the Prom layer converts to deltas.
+    # Empty unless VLLM_SPEC_PHASE_TIMING=1 in the worker environment.
+    phase_timings: dict[str, tuple[float, int]] = field(default_factory=dict)
+
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
         return cls(
@@ -37,6 +43,15 @@ class SpecDecodingStats:
             num_accepted_tokens_per_pos=[0] * num_spec_tokens,
             num_draft_tokens_per_pos=[0] * num_spec_tokens,
         )
+
+    def observe_phase_timings(self, timings: dict[str, tuple[float, int]] | None):
+        """Record the worker's cumulative phase timings for this step.
+
+        Last-write-wins rather than accumulating: the worker's numbers are ALREADY
+        cumulative over its lifetime, so summing them across steps would multiply-count.
+        """
+        if timings:
+            self.phase_timings = dict(timings)
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         self.num_drafts += 1
@@ -209,6 +224,9 @@ class SpecDecodingProm:
         # not apply, so it is omitted.
         self.is_diffusion = is_diffusion
         self.spec_decoding_enabled = speculative_config is not None or is_diffusion
+        # kept for the lazily-created phase-timing counters
+        self._phase_labelnames = labelnames
+        self._phase_labelvalues = per_engine_labelvalues
         if not self.spec_decoding_enabled:
             return
 
@@ -263,9 +281,76 @@ class SpecDecodingProm:
                 for idx, lv in per_engine_labelvalues.items()
             }
 
+    # Phase-timing counters, created lazily on first sight of a phase. Lazy because the
+    # set of phases depends on what the worker actually ran (a method with no separate
+    # scoring step never emits one), and declaring counters that stay at zero is worse
+    # than declaring none -- a zero reads as "measured, and it was free".
+    _PHASE_METRIC_NAMES = {
+        "target_forward": "vllm:spec_decode_target_forward_time_seconds",
+        "draft_forward": "vllm:spec_decode_draft_time_seconds",
+        "scoring": "vllm:spec_decode_scoring_time_seconds",
+        "comm.target_forward": "vllm:spec_decode_comm_target_forward_time_seconds",
+        "comm.draft_forward": "vllm:spec_decode_comm_draft_time_seconds",
+        "comm.scoring": "vllm:spec_decode_comm_scoring_time_seconds",
+        "comm.other": "vllm:spec_decode_comm_time_seconds",
+    }
+    _PHASE_COUNT_NAMES = {
+        "comm.target_forward": "vllm:spec_decode_comm_target_forward_count",
+        "comm.draft_forward": "vllm:spec_decode_comm_draft_count",
+        "comm.scoring": "vllm:spec_decode_comm_scoring_count",
+        "comm.other": "vllm:spec_decode_comm_count",
+    }
+
+    def _phase_counter(self, key: str, name: str, engine_idx: int):
+        cache = getattr(self, "_phase_counters", None)
+        if cache is None:
+            cache = self._phase_counters = {}
+        ck = (key, engine_idx)
+        if ck not in cache:
+            try:
+                cache[ck] = self._counter_cls(
+                    name=name,
+                    documentation=f"Spec-decode phase timing: {key}.",
+                    labelnames=self._phase_labelnames,
+                ).labels(*self._phase_labelvalues[engine_idx])
+            except Exception:
+                cache[ck] = None      # duplicate registration etc: degrade, do not crash
+        return cache[ck]
+
+    def _observe_phase_timings(self, stats: SpecDecodingStats, engine_idx: int):
+        """Emit phase timings as counters.
+
+        The worker reports CUMULATIVE totals, but Prometheus counters take an increment,
+        so track the last value per (phase, engine) and inc by the delta. A decrease
+        means the worker restarted, in which case the new value IS the delta.
+        """
+        if not stats.phase_timings:
+            return
+        prev = getattr(self, "_phase_prev", None)
+        if prev is None:
+            prev = self._phase_prev = {}
+        for key, (total_ms, count) in stats.phase_timings.items():
+            name = self._PHASE_METRIC_NAMES.get(key)
+            if name is None:
+                continue
+            pk = (key, engine_idx)
+            last_ms, last_ct = prev.get(pk, (0.0, 0))
+            d_ms = total_ms - last_ms if total_ms >= last_ms else total_ms
+            d_ct = count - last_ct if count >= last_ct else count
+            prev[pk] = (total_ms, count)
+            c = self._phase_counter(key, name, engine_idx)
+            if c is not None and d_ms > 0:
+                c.inc(d_ms / 1000.0)          # metric is in SECONDS
+            cname = self._PHASE_COUNT_NAMES.get(key)
+            if cname and d_ct > 0:
+                cc = self._phase_counter(key + ".count", cname, engine_idx)
+                if cc is not None:
+                    cc.inc(d_ct)
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
+        self._observe_phase_timings(spec_decoding_stats, engine_idx)
         self.counter_spec_decode_num_drafts[engine_idx].inc(
             spec_decoding_stats.num_drafts
         )

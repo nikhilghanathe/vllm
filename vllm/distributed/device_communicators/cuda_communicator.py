@@ -273,6 +273,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # Opt-in comm timing (VLLM_SPEC_PHASE_TIMING=1); a no-op otherwise. This is the
+        # single funnel for TP all-reduce, so one hook attributes every collective to the
+        # phase currently open (comm.target_forward / comm.draft_forward).
+        from vllm.v1.spec_decode import phase_timer as _spec_phase_timer
+
+        with _spec_phase_timer.comm_scope():
+            return self._all_reduce_impl(input_)
+
+    def _all_reduce_impl(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(

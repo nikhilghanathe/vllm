@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 import contextlib
+import json
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -31,6 +34,9 @@ class StepTimingSample:
     num_target_tokens: int
     num_reqs: int
     full_cudagraph: bool
+    # Appended last, with a default, so the profiling path's positional
+    # construction below is unaffected. Only the streaming path records it.
+    scoring_ms: float = 0.0
 
 
 def _timing_event() -> torch.cuda.Event:
@@ -43,6 +49,16 @@ class StepTimingEvents:
     forward_end: torch.cuda.Event = field(default_factory=_timing_event)
     drafter_start: torch.cuda.Event = field(default_factory=_timing_event)
     drafter_end: torch.cuda.Event = field(default_factory=_timing_event)
+    scoring_start: torch.cuda.Event = field(default_factory=_timing_event)
+    scoring_end: torch.cuda.Event = field(default_factory=_timing_event)
+    # elapsed_time() raises on an unrecorded pair, and the profiling path never
+    # scores, so the pair must announce itself rather than be assumed.
+    scoring_recorded: bool = False
+    # The batch shape is bound to the step when it is armed, not read off the
+    # collector when it closes. execute_model and sample_tokens are separate
+    # worker RPCs, so another batch can be recorded in between; reading a mutable
+    # field at close time labels this step's cost with that batch's shape.
+    batch: tuple[bool, int, int] = (False, 0, 0)
 
 
 class StepTimingCollector:
@@ -50,13 +66,113 @@ class StepTimingCollector:
 
     Every step gets its own events, so the steps queue back-to-back and the
     block resolves them all behind one sync on the way out.
+
+    STREAMING MODE (VLLM_SPEC_STEP_TIMING=1) additionally times every *serving*
+    step, not just the profiling dummy runs, and folds the results into buckets
+    keyed by (full_cudagraph, num_target_tokens, num_reqs).
+
+    Why buckets and not a lifetime total: verify cost is linear in total tokens
+    B*(L+1), so a single cumulative mean answers nothing -- the cost *curve* is
+    the result. Keying on num_target_tokens also keeps prefill steps (thousands
+    of tokens) in their own buckets instead of blending into the verify mean,
+    which is the prefill-exclusion problem solved structurally rather than with
+    a flag.
+
+    Streaming never feeds the profiling path: ``collect`` owns the events while
+    it is open, so adaptive verification's cost curves are unperturbed.
     """
 
     def __init__(self):
         self._collecting = False
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
+        self._dummy = False
         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+
+        self._streaming = bool(
+            os.environ.get("VLLM_SPEC_STEP_TIMING")
+        ) and torch.cuda.is_available()
+        # key -> [steps, forward_ms, scoring_ms, drafter_ms, scored_steps]
+        self._buckets: dict[tuple[bool, int, int], list[float]] = {}
+        self._pending: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        # elapsed_time() needs a device sync, so fold in batches: per step it
+        # would serialise the GPU and measure its own overhead.
+        self._flush_every = int(os.environ.get("VLLM_SPEC_STEP_FLUSH_EVERY", "64"))
+        if self._streaming:
+            atexit.register(self._flush)
+
+    # ---------------- streaming sink ----------------
+
+    def _rank(self) -> int:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank()
+        except Exception:
+            pass
+        return int(os.environ.get("RANK", "0"))
+
+    def _flush(self) -> None:
+        """Resolve pending events into buckets and write the sink."""
+        if not self._pending:
+            return
+        # Same stream, issue order: the last step's end implies all the rest.
+        self._pending[-1][0].drafter_end.synchronize()
+        for events, (full_cudagraph, num_target_tokens, num_reqs) in self._pending:
+            try:
+                fwd = events.forward_start.elapsed_time(events.forward_end)
+                draft = events.drafter_start.elapsed_time(events.drafter_end)
+                score = (
+                    events.scoring_start.elapsed_time(events.scoring_end)
+                    if events.scoring_recorded
+                    else 0.0
+                )
+            except Exception:
+                # A step can unwind between two records (an aborted capture does
+                # exactly this). Drop it rather than lose every other bucket.
+                continue
+            key = (full_cudagraph, num_target_tokens, num_reqs)
+            acc = self._buckets.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+            acc[0] += 1
+            acc[1] += fwd
+            acc[2] += score
+            acc[3] += draft
+            # Not every step scores (a step with no draft tokens takes the plain
+            # sampler), so scoring needs its own denominator. Dividing scoring_ms
+            # by `steps` would silently under-report the mean.
+            acc[4] += 1.0 if events.scoring_recorded else 0.0
+        self._pending.clear()
+        self._write()
+
+    def _write(self) -> None:
+        out = os.environ.get("VLLM_SPEC_STEP_TIMING_OUT")
+        if not out:
+            return
+        base, ext = os.path.splitext(out)
+        # Per rank: rank spread is itself a result. Collapsing to rank 0 would
+        # report one rank's spin-wait as the cost.
+        path = f"{base}.rank{self._rank()}{ext or '.json'}"
+        rows = [
+            {
+                "full_cudagraph": k[0],
+                "num_target_tokens": k[1],
+                "num_reqs": k[2],
+                "steps": int(v[0]),
+                "scored_steps": int(v[4]),
+                "forward_ms": v[1],
+                "scoring_ms": v[2],
+                "drafter_ms": v[3],
+            }
+            for k, v in sorted(self._buckets.items())
+        ]
+        try:
+            # Written incrementally: workers are usually SIGKILLed, so atexit
+            # alone is not a reliable path to a sink on disk.
+            with open(path, "w") as f:
+                json.dump({"_rank": self._rank(), "buckets": rows}, f)
+        except Exception:
+            pass
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -87,18 +203,54 @@ class StepTimingCollector:
             for events, (full_cudagraph, num_target_tokens, num_reqs) in timed
         )
 
-    def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
+    def record_batch(
+        self,
+        input_batch: "InputBatch",
+        full_cudagraph: bool,
+        dummy_run: bool = False,
+    ) -> None:
         """Costs from different execution modes must not share a cost curve."""
         self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
+        self._dummy = dummy_run
 
     def forward_start(self) -> None:
-        if self._collecting:
-            self._step = StepTimingEvents()
+        if self._streaming and not self._collecting and self._dummy:
+            # A dummy run is warmup, not workload, and it also closes its forward
+            # pair itself (in _dummy_run, after execute_model returns) -- so a
+            # streamed dummy step would be double-ended as well as meaningless.
+            # Profiling still times dummy runs; that is all it times.
+            self._step = None
+            return
+        if self._collecting or self._streaming:
+            # A step that never reached drafter_end (no speculator, or an error
+            # between the two) is abandoned here rather than left to pair its
+            # start with the next step's end.
+            self._step = StepTimingEvents(batch=self._batch)
             self._step.forward_start.record()
 
     def forward_end(self) -> None:
         if self._step is not None:
             self._step.forward_end.record()
+
+    def forward_end_serving(self) -> None:
+        """Close the forward pair on the serving path.
+
+        Separate from ``forward_end`` because during profiling the dummy run
+        closes the pair itself, *after* execute_model returns; recording twice
+        would move the end event and silently reprice adaptive verification's
+        cost curves.
+        """
+        if self._streaming and not self._collecting:
+            self.forward_end()
+
+    def scoring_start(self) -> None:
+        if self._step is not None:
+            self._step.scoring_start.record()
+
+    def scoring_end(self) -> None:
+        if self._step is not None:
+            self._step.scoring_end.record()
+            self._step.scoring_recorded = True
 
     def drafter_start(self) -> None:
         if self._step is not None:
@@ -108,7 +260,12 @@ class StepTimingCollector:
         """Ends the step: only steps that reach here have a draft cost."""
         if self._step is not None:
             self._step.drafter_end.record()
-            self._timed.append((self._step, self._batch))
+            if self._collecting:
+                self._timed.append((self._step, self._step.batch))
+            elif self._streaming:
+                self._pending.append((self._step, self._step.batch))
+                if len(self._pending) >= self._flush_every:
+                    self._flush()
             self._step = None
 
 
