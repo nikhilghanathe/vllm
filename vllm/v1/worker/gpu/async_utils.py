@@ -169,8 +169,16 @@ class StepTimingCollector:
         try:
             # Written incrementally: workers are usually SIGKILLed, so atexit
             # alone is not a reliable path to a sink on disk.
-            with open(path, "w") as f:
+            #
+            # Write-then-rename, because this file is rewritten every flush while
+            # analysis reads it live: an in-place open(w) truncates first, so a
+            # reader lands on a half-written file and gets a JSONDecodeError.
+            # rename is atomic within a filesystem, so a reader sees either the
+            # previous complete sink or the new one, never a torn one.
+            tmp = f"{path}.tmp{os.getpid()}"
+            with open(tmp, "w") as f:
                 json.dump({"_rank": self._rank(), "buckets": rows}, f)
+            os.replace(tmp, path)
         except Exception:
             pass
 

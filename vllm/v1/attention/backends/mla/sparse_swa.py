@@ -5,7 +5,9 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -161,6 +163,9 @@ class DeepseekSparseSWABackend(AttentionBackend):
         if include_num_layers_dimension:
             return (0, 1, 2, 3)
         return (0, 1, 2)
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -432,6 +437,30 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             2 if (spec_config is not None and spec_config.parallel_drafting) else 1
         )
         self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        # decode_threshold only ROUTES -- it is "the maximum query length to be
+        # considered a decode", not a statement about what can be attended over.
+        # FlashMLA's decode kernel is a short-query fast path with a tile limit, so
+        # past that width the routing hands it queries it rejects outright (CUDA
+        # "invalid argument" in get_decoding_sched_meta). Capping the threshold sends
+        # those steps down the prefill path instead, which has no such limit and is
+        # the same attention -- it is what serves multi-thousand-token prompts.
+        #
+        # A speculative decode step gives every request the same query length, so the
+        # decode/prefill split is all-or-nothing here and stays consistent with the
+        # ordering split_decodes_and_prefills expects.
+        #
+        # Off by default; see VLLM_SPARSE_SWA_MAX_DECODE_QLEN for why the limit has to
+        # be supplied rather than assumed.
+        max_decode_qlen = envs.VLLM_SPARSE_SWA_MAX_DECODE_QLEN
+        if max_decode_qlen > 0 and self.decode_threshold > max_decode_qlen:
+            logger.info_once(
+                "sparse_swa: capping decode_threshold %d -> %d "
+                "(VLLM_SPARSE_SWA_MAX_DECODE_QLEN); wider speculative-verify steps "
+                "take the prefill path.",
+                self.decode_threshold,
+                max_decode_qlen,
+            )
+            self.decode_threshold = max_decode_qlen
         self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config

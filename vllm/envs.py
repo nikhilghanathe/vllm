@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_SWA_MAX_DECODE_QLEN: int = 0
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1071,6 +1072,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Largest query length the sparse-SWA backend may route to FlashMLA's DECODE
+    # kernel. That kernel is a short-query fast path with a tile limit; the prefill
+    # path has no such limit and serves the same attention (it is what runs
+    # multi-thousand-token prompts). decode_threshold only ROUTES, so capping it
+    # sends wider speculative-verify steps to prefill instead of into a kernel that
+    # rejects them with a CUDA "invalid argument".
+    #
+    # Measured on 4xH100, TP4, DeepSeek-V4-Flash (64 heads -> 16/rank): query length
+    # 15 works, 17 fails in get_decoding_sched_meta. The limit tracks
+    # s_q * heads_per_rank, so it is configuration-dependent -- hence an explicit
+    # value rather than a built-in constant. 0 (default) keeps upstream behaviour.
+    "VLLM_SPARSE_SWA_MAX_DECODE_QLEN": lambda: int(
+        os.getenv("VLLM_SPARSE_SWA_MAX_DECODE_QLEN", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
