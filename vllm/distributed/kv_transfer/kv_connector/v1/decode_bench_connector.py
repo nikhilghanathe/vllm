@@ -58,6 +58,31 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+def _make_fill_values(shape, dtype, device, mean: float, std: float) -> torch.Tensor:
+    """Build dummy KV values for any cache dtype, including fp8.
+
+    vLLM stores an fp8 KV cache as raw ``uint8`` bytes. Two things break if that is
+    ignored, and both were hit in practice:
+
+    * ``torch.full(shape, 0.015, dtype=torch.uint8)`` truncates to **0**, so the cache is
+      filled with zeros rather than the requested value.
+    * ``torch.normal(..., dtype=torch.uint8)`` raises
+      ``"normal_kernel_cuda" not implemented for 'Byte'``, so ``fill_std > 0`` is
+      unusable exactly when varied values are wanted.
+
+    Sampling in float32 and reinterpreting through fp8 fixes both.
+    """
+    if std > 0:
+        vals = torch.empty(shape, dtype=torch.float32, device=device).normal_(mean, std)
+    else:
+        vals = torch.full(shape, mean, dtype=torch.float32, device=device)
+
+    if dtype == torch.uint8:
+        return vals.to(torch.float8_e4m3fn).view(torch.uint8)
+    return vals.to(dtype)
+
+
+
 
 @dataclass
 class DecodeBenchConnectorMetadata(KVConnectorMetadata):
@@ -440,25 +465,16 @@ class DecodeBenchConnectorWorker:
         if len(valid_block_ids) == 0:
             return
 
-        # Create fill values - either constant or random
+        # Create fill values - either constant or random. Goes through
+        # _make_fill_values so an fp8 (uint8-backed) cache is handled correctly.
         block_shape = kv_cache.shape[1:]
-        if self.fill_std > 0:
-            # Random normal sampling
-            fill_values = torch.normal(
-                mean=self.fill_mean,
-                std=self.fill_std,
-                size=(len(valid_block_ids),) + block_shape,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
-        else:
-            # Constant fill value
-            fill_values = torch.full(
-                (len(valid_block_ids),) + block_shape,
-                self.fill_mean,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
+        fill_values = _make_fill_values(
+            (len(valid_block_ids),) + tuple(block_shape),
+            kv_cache.dtype,
+            kv_cache.device,
+            self.fill_mean,
+            self.fill_std,
+        )
 
         # Batch fill operation
         kv_cache[valid_block_ids] = fill_values
@@ -474,7 +490,12 @@ class DecodeBenchConnectorWorker:
         Args:
             kv_cache: A state tensor to fill in its entirety.
         """
-        if self.fill_std > 0:
-            kv_cache.normal_(mean=self.fill_mean, std=self.fill_std)
-        else:
-            kv_cache.fill_(self.fill_mean)
+        kv_cache.copy_(
+            _make_fill_values(
+                tuple(kv_cache.shape),
+                kv_cache.dtype,
+                kv_cache.device,
+                self.fill_mean,
+                self.fill_std,
+            )
+        )
